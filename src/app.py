@@ -1,126 +1,176 @@
-import mlflow.xgboost
-import pandas as pd
+import json
+import os
 import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from contextlib import asynccontextmanager  
 import numpy as np
+import pandas as pd
+import xgboost as xgb
+import redis 
+from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 
+# IMPORT SCHEMAS
 from src.schemas import OrderRequest, ETAResponse
 
-
-OSRM_HOST = "http://localhost:5000"
+# --- Configuration ---
+OSRM_HOST = os.getenv("OSRM_HOST", "http://localhost:5000")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost") 
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
 models = {}
+redis_client = None
 
-def get_latest_model_uri(experiment_name):
-    experiment = mlflow.get_experiment_by_name(experiment_name)
-    if not experiment:
-        raise ValueError(f"Experiment '{experiment_name}' does not exist.")
-    runs = mlflow.search_runs(
-        experiment_ids=[experiment.experiment_id],
-        order_by = ["start_time DESC"],
-        max_results=1
-    )
-    if runs.empty:
-        raise ValueError(f"No runs found in experiment '{experiment_name}'")
-    return f"runs:/{runs.iloc[0]['run_id']}/model"
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Loading models from MLflow...")
+# --- Helper Functions ---
+def get_restaurant_load(restaurant_id: str) -> int:
+    """Queries Redis for the last 4 buckets (20 mins) of order volume."""
+    if not redis_client:
+        return 0
     try:
-        models['cooking'] = mlflow.xgboost.load_model(get_latest_model_uri("ETA_Cooking_Prediction"))
-        models['allocation'] = mlflow.xgboost.load_model(get_latest_model_uri("ETA_Allocation_Prediction"))
-        models['delivery'] = mlflow.xgboost.load_model(get_latest_model_uri("ETA_LastMile_Prediction"))
-        print("Models loaded successfully.")
+        import time
+        current_ts = int(time.time())
+        bucket_size = 300
+        current_bucket = (current_ts // bucket_size) * bucket_size
+        keys = []
+        for i in range(4):
+            t = current_bucket - (i * bucket_size)
+            keys.append(f"load:{restaurant_id}:{t}")
+        values = redis_client.mget(keys)
+        return sum([int(v) for v in values if v is not None])
     except Exception as e:
-        print(f"❌Error loading models: {e}")
-        
-    yield
-    print("Shutting down application...")
-
-app = FastAPI(title = "ETA Prediction Engine", lifespan=lifespan)
+        print(f"⚠️ Redis Read Error: {e}")
+        return 0
 
 def get_osm_physics(start_coords, end_coords):
     url = f"{OSRM_HOST}/route/v1/driving/{start_coords[0]},{start_coords[1]};{end_coords[0]},{end_coords[1]}"
     try:
-        resp = requests.get(url, params={"overview": "false"}, timeout = 1.0)    
+        resp = requests.get(url, params={"overview": "false"}, timeout=2.0)    
         if resp.status_code == 200 and resp.json()["code"] == "Ok":
             route = resp.json()["routes"][0]
             return route["distance"], route["duration"]
-    except:
-        return 0,0
-    return 0,0
+    except Exception as e:
+        print(f"OSRM Connection Error: {e}")
+    return 0.0, 0.0
 
-# --- Helper: Traffic Logic ---
 def estimate_traffic_factor(hour_of_day: float) -> float:
-    """
-    Estimates traffic based on the time of day using the same 
-    Gaussian logic as our training data.
-    """
-   
     morning_peak = 0.4 * np.exp(-0.5 * ((hour_of_day - 9) / 2) ** 2)
-   
     evening_peak = 0.5 * np.exp(-0.5 * ((hour_of_day - 18) / 2) ** 2)
-    
     return 1.0 + morning_peak + evening_peak
 
-@app.post("/predict", response_model = ETAResponse)
-def predict_eta(req: OrderRequest):
-    if "cooking" not in models:
-        raise HTTPException(status_code=503, detail="Models are not loaded .")
+# --- Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Starting ETA Engine...")
     
-    dist, duration = get_osm_physics(
-        (req.start_lon, req.start_lat),
-        (req.end_lon, req.end_lat)
-    )
+    # Connect to Redis
+    global redis_client
+    try:
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        redis_client.ping()
+        print(f"✅ Connected to Redis at {REDIS_HOST}")
+    except Exception as e:
+        print(f"❌ Redis Connection Failed: {e}")
 
+    # Load Models
+    if not os.path.exists("model_manifest.json"):
+        print("❌ CRITICAL: model_manifest.json not found!")
+    else:
+        with open("model_manifest.json", "r") as f:
+            manifest = json.load(f)
+
+        key_map = {
+            "ETA_Cooking_Prediction": "cooking",
+            "ETA_Allocation_Prediction": "allocation",
+            "ETA_LastMile_Prediction": "delivery"
+        }
+
+        for exp_name, app_key in key_map.items():
+            if exp_name in manifest:
+                path = manifest[exp_name].replace("\\", "/")
+                if os.path.exists(path):
+                    try:
+                        booster = xgb.Booster()
+                        booster.load_model(path)
+                        models[app_key] = booster
+                        print(f"✅ {app_key} MODEL LOADED.")
+                    except Exception as e:
+                        print(f"❌ Error loading {app_key}: {e}")
+                else:
+                    print(f"⚠️ Missing file: {path}")
+
+    yield
+    print("Shutting down...")
+
+app = FastAPI(title="ETA Prediction Engine", lifespan=lifespan)
+
+# --- Prediction Endpoint ---
+@app.post("/predict", response_model=ETAResponse)
+def predict_eta(req: OrderRequest):
+    if not models:
+        raise HTTPException(status_code=503, detail="Models are not loaded.")
+    
+    # 1. Get Live Data
+    active_orders = get_restaurant_load(req.restaurant_id)
+    
+    # 2. Physics & Traffic
+    dist, duration = get_osm_physics((req.start_lon, req.start_lat), (req.end_lon, req.end_lat))
+    traffic_factor = estimate_traffic_factor(req.hour_of_day)
+
+    # 3. ML Inference
+    # A. Cooking
     df_cook = pd.DataFrame([{
         'items_count': req.items_count,
         'cuisine_complexity': req.cuisine_complexity,
         'hour_of_day': req.hour_of_day,
         'day_of_week': req.day_of_week
     }])
+    dmat_cook = xgb.DMatrix(df_cook)
+    base_cooking_sec = models['cooking'].predict(dmat_cook)[0]
+    
+    # Apply "Busy Kitchen" Heuristic
+    kitchen_delay = active_orders * 60.0
+    final_cooking_sec = base_cooking_sec + kitchen_delay
 
-    cook_pred = models['cooking'].predict(df_cook)[0]
-
+    # B. Allocation
     df_alloc = pd.DataFrame([{
         "rider_supply_index": req.rider_supply_index,
         "hour_of_day": req.hour_of_day,
         "day_of_week": req.day_of_week
     }])
-    alloc_pred = models['allocation'].predict(df_alloc)[0]
+    dmat_alloc = xgb.DMatrix(df_alloc)
+    alloc_sec = models['allocation'].predict(dmat_alloc)[0]
 
-    estimated_traffic = estimate_traffic_factor(req.hour_of_day)
-
+    # C. Delivery
     df_deliv = pd.DataFrame([{
         "osrm_distance": dist,
         "osrm_duration": duration,
-        "traffic_factor": estimated_traffic,
-        "hour_of_day": req.hour_of_day,
-
+        "traffic_factor": traffic_factor,
+        "hour_of_day": req.hour_of_day
     }])
+    dmat_deliv = xgb.DMatrix(df_deliv)
+    travel_sec = models['delivery'].predict(dmat_deliv)[0]
 
-    deliv_pred = models['delivery'].predict(df_deliv)[0]
+    # 4. Total
+    total = final_cooking_sec + alloc_sec + travel_sec
 
-    total_seconds = cook_pred + alloc_pred + deliv_pred
-
-    return{
-        "breakdown":{
-            "cooking_seconds": int(cook_pred),
-            "allocation_seconds": int(alloc_pred),
-            "delivery_seconds": int(deliv_pred)
+    return ETAResponse(
+        breakdown={
+            "cooking_seconds": int(base_cooking_sec),
+            "kitchen_delay_seconds": int(kitchen_delay),
+            "allocation_seconds": int(alloc_sec),
+            "delivery_seconds": int(travel_sec)
         },
-        "total_eta_seconds": int(total_seconds),
-        "total_eta_minutes": round(total_seconds / 60.0, 1),
-        "physics_data":{
+        total_eta_seconds=int(total),
+        total_eta_minutes=round(total / 60.0, 1),
+        physics_data={
             "distance_meters": dist,
             "base_duration": duration
+        },
+        live_context={
+            "restaurant_id": req.restaurant_id,
+            "active_orders_last_20m": active_orders,
+            "data_source": "Redis Real-Time Store"
         }
-    }
+    )
 
 if __name__ == "__main__":  
-    uvicorn.run("src.app:app", host = "0.0.0.0", port=8000, reload=True)
-
+    uvicorn.run("src.app:app", host="0.0.0.0", port=8000, reload=True)

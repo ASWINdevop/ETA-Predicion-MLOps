@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
+from typing import Dict, Any
 
-
+# 1. Request Schema (Restored your Validations)
 class OrderRequest(BaseModel):
     restaurant_id: str
     items_count: int = Field(..., gt=0, description="Number of items in the order")
@@ -17,8 +18,10 @@ class OrderRequest(BaseModel):
     hour_of_day: int = Field(..., ge=0, le=23)
     day_of_week: int = Field(..., ge=0, le=6)
 
+# 2. Response Schema (Added live_context)
 class ETAResponse(BaseModel):
     total_eta_seconds: int
     total_eta_minutes: float
-    breakdown: dict
-    physics_data: dict
+    breakdown: Dict[str, int]
+    physics_data: Dict[str, float]
+    live_context: Dict[str, Any] # NEW: Critical for Redis feedback
