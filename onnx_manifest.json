@@ -1,0 +1,5 @@
+{
+    "ETA_Cooking_Prediction": "mlruns/1/models/m-f816d012af794df897982033eaaedcda/artifacts/model.onnx",
+    "ETA_Allocation_Prediction": "mlruns/2/models/m-84bc6b59aa2e4674868925ead1984b6d/artifacts/model.onnx",
+    "ETA_LastMile_Prediction": "mlruns/3/models/m-2da6fad527214ea6a055ff4b385d44e1/artifacts/model.onnx"
+}
