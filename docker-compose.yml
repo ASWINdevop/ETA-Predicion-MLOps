@@ -18,10 +18,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # INTERNAL: The App talks to Kafka via the internal Docker name/port
       - OSRM_HOST=http://osrm:5000
       - REDIS_HOST=redis
       - KAFKA_BROKER=kafka:29092
+    volumes:
+      #  Mount current directory (.) to /app inside container
+      #  any file created in /app appears on your Windows machine instantly.
+      - .:/app
     depends_on:
       - osrm
       - redis
@@ -35,32 +38,22 @@ services:
     ports:
       - "6379:6379"
 
-  # 4. Event Bus (Kafka with Split Listeners)
+  # 4. Event Bus (Kafka)
   kafka:
     image: apache/kafka:latest
     container_name: kafka-broker
     restart: always
     ports:
-      - "9092:9092"  # Exposed to Windows (External)
+      - "9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      
-      # Three Listeners:
-      # 1. CONTROLLER: Internal management (Port 9093)
-      # 2. INTERNAL: For Docker containers (Port 29092)
-      # 3. EXTERNAL: For your Windows Scripts (Port 9092)
       KAFKA_LISTENERS: CONTROLLER://:9093,INTERNAL://:29092,EXTERNAL://:9092
-      
-      # The "Phone Book" entries given to clients:
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      
-      # Dev settings
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1

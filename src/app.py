@@ -3,9 +3,8 @@ import os
 import requests
 import uvicorn
 import numpy as np
-import pandas as pd
-import xgboost as xgb
 import redis 
+import onnxruntime as ort  # NEW: High Performance Runtime
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 
@@ -17,6 +16,7 @@ OSRM_HOST = os.getenv("OSRM_HOST", "http://localhost:5000")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost") 
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
+# Models Dictionary will now store ONNX Sessions, not XGBoost Boosters
 models = {}
 redis_client = None
 
@@ -59,9 +59,9 @@ def estimate_traffic_factor(hour_of_day: float) -> float:
 # --- Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Starting ETA Engine...")
+    print("🚀 Starting ONNX ETA Engine...")
     
-    # Connect to Redis
+    # 1. Connect to Redis
     global redis_client
     try:
         redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -70,11 +70,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Redis Connection Failed: {e}")
 
-    # Load Models
-    if not os.path.exists("model_manifest.json"):
-        print("❌ CRITICAL: model_manifest.json not found!")
+    # 2. Load ONNX Models
+    # We look for onnx_manifest.json now
+    if not os.path.exists("onnx_manifest.json"):
+        print("❌ CRITICAL: onnx_manifest.json not found! Run convert_to_onnx.py first.")
     else:
-        with open("model_manifest.json", "r") as f:
+        with open("onnx_manifest.json", "r") as f:
             manifest = json.load(f)
 
         key_map = {
@@ -88,10 +89,10 @@ async def lifespan(app: FastAPI):
                 path = manifest[exp_name].replace("\\", "/")
                 if os.path.exists(path):
                     try:
-                        booster = xgb.Booster()
-                        booster.load_model(path)
-                        models[app_key] = booster
-                        print(f"✅ {app_key} MODEL LOADED.")
+                        # Load into ONNX Runtime
+                        session = ort.InferenceSession(path)
+                        models[app_key] = session
+                        print(f"✅ {app_key} ONNX MODEL LOADED.")
                     except Exception as e:
                         print(f"❌ Error loading {app_key}: {e}")
                 else:
@@ -115,39 +116,45 @@ def predict_eta(req: OrderRequest):
     dist, duration = get_osm_physics((req.start_lon, req.start_lat), (req.end_lon, req.end_lat))
     traffic_factor = estimate_traffic_factor(req.hour_of_day)
 
-    # 3. ML Inference
-    # A. Cooking
-    df_cook = pd.DataFrame([{
-        'items_count': req.items_count,
-        'cuisine_complexity': req.cuisine_complexity,
-        'hour_of_day': req.hour_of_day,
-        'day_of_week': req.day_of_week
-    }])
-    dmat_cook = xgb.DMatrix(df_cook)
-    base_cooking_sec = models['cooking'].predict(dmat_cook)[0]
+    # 3. ONNX Inference
+    # ONNX expects a Float32 Numpy Array of shape [1, N_features]
     
-    # Apply "Busy Kitchen" Heuristic
+    # A. Cooking (4 features)
+    input_cook = np.array([[
+        req.items_count, 
+        req.cuisine_complexity, 
+        req.hour_of_day, 
+        req.day_of_week
+    ]], dtype=np.float32)
+    
+    # Run Inference
+    # input_name is usually 'float_input' from our converter script
+    input_name = models['cooking'].get_inputs()[0].name
+    base_cooking_sec = models['cooking'].run(None, {input_name: input_cook})[0][0]
+    
     kitchen_delay = active_orders * 60.0
     final_cooking_sec = base_cooking_sec + kitchen_delay
 
-    # B. Allocation
-    df_alloc = pd.DataFrame([{
-        "rider_supply_index": req.rider_supply_index,
-        "hour_of_day": req.hour_of_day,
-        "day_of_week": req.day_of_week
-    }])
-    dmat_alloc = xgb.DMatrix(df_alloc)
-    alloc_sec = models['allocation'].predict(dmat_alloc)[0]
+    # B. Allocation (3 features)
+    input_alloc = np.array([[
+        req.rider_supply_index, 
+        req.hour_of_day, 
+        req.day_of_week
+    ]], dtype=np.float32)
+    
+    input_name = models['allocation'].get_inputs()[0].name
+    alloc_sec = models['allocation'].run(None, {input_name: input_alloc})[0][0]
 
-    # C. Delivery
-    df_deliv = pd.DataFrame([{
-        "osrm_distance": dist,
-        "osrm_duration": duration,
-        "traffic_factor": traffic_factor,
-        "hour_of_day": req.hour_of_day
-    }])
-    dmat_deliv = xgb.DMatrix(df_deliv)
-    travel_sec = models['delivery'].predict(dmat_deliv)[0]
+    # C. Delivery (4 features)
+    input_deliv = np.array([[
+        dist, 
+        duration, 
+        traffic_factor, 
+        req.hour_of_day
+    ]], dtype=np.float32)
+    
+    input_name = models['delivery'].get_inputs()[0].name
+    travel_sec = models['delivery'].run(None, {input_name: input_deliv})[0][0]
 
     # 4. Total
     total = final_cooking_sec + alloc_sec + travel_sec
