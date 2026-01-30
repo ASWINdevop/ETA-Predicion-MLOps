@@ -18,3 +18,24 @@ data/
 
 
 notebooks/
+
+# Ignore the massive map data
+data/
+*.osrm*
+
+
+# Ignore Terraform state (contains sensitive IPs/IDs)
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+.terraform.lock.hcl
+
+
+# Ignore IDE settings
+.vscode/
+.idea/
+.DS_Store
+
+# 3. MLflow & Database
+mlruns/
+mlflow.db

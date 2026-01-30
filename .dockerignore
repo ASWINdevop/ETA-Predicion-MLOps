@@ -1,0 +1,14 @@
+# Ignore heavy local folders
+.git
+.venv
+__pycache__
+*.pyc
+.DS_Store
+
+# Ignore large model history (we only copy the manifest and specific files)
+mlruns
+*.csv
+
+# Ignore infrastructure state
+infra/.terraform
+infra/terraform.tfstate
