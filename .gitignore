@@ -23,7 +23,7 @@ notebooks/
 data/
 *.osrm*
 
-*.onnx
+
 # Ignore Terraform state (contains sensitive IPs/IDs)
 infra/.terraform/
 infra/terraform.tfstate
