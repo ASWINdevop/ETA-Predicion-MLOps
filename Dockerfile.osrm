@@ -1,0 +1,12 @@
+# Start from the official engine
+FROM osrm/osrm-backend:latest
+
+# Create the data directory
+WORKDIR /data
+
+# COPY your local map data INSIDE the container image
+COPY data/map.osrm .
+COPY data/map.osrm.* .
+
+# Set the default command to run using this internal map
+CMD ["osrm-routed", "--algorithm", "mld", "/data/map.osrm"]

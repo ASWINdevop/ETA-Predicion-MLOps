@@ -22,7 +22,7 @@ notebooks/
 # Ignore the massive map data
 data/
 *.osrm*
-
+!Dockerfile.osrm
 
 # Ignore Terraform state (contains sensitive IPs/IDs)
 infra/.terraform/
