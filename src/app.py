@@ -1,41 +1,62 @@
 import json
 import os
+import time
 import requests
 import uvicorn
 import numpy as np
 import redis 
-import onnxruntime as ort  # NEW: High Performance Runtime
+import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 
-# IMPORT SCHEMAS
+# IMPORT SCHEMAS (Assumes you have these in src/schemas.py)
+# If you get an import error, define them inline!
 from src.schemas import OrderRequest, ETAResponse
 
+print("🚀 -------------------------------------------------")
+print("🚀 STARTING NEW VERSION (With Clean Paths)")
+print("🚀 -------------------------------------------------")
 # --- Configuration ---
 OSRM_HOST = os.getenv("OSRM_HOST", "http://localhost:5000")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost") 
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-# Models Dictionary will now store ONNX Sessions, not XGBoost Boosters
+# Models Dictionary
 models = {}
 redis_client = None
 
+# --- New Schema for Simulation ---
+class TrafficSimulation(BaseModel):
+    restaurant_id: str
+    orders_added: int
+
 # --- Helper Functions ---
 def get_restaurant_load(restaurant_id: str) -> int:
-    """Queries Redis for the last 4 buckets (20 mins) of order volume."""
+    """Queries Redis for the last 4 buckets (20 mins) + Simulated Load."""
     if not redis_client:
         return 0
     try:
-        import time
         current_ts = int(time.time())
         bucket_size = 300
         current_bucket = (current_ts // bucket_size) * bucket_size
+        
+        # 1. Get Real Traffic (Time Buckets)
         keys = []
         for i in range(4):
             t = current_bucket - (i * bucket_size)
             keys.append(f"load:{restaurant_id}:{t}")
+        
+        # 2. Get Simulated Traffic (The key we inject during testing)
+        sim_key = f"simulation:{restaurant_id}"
+        keys.append(sim_key)
+
         values = redis_client.mget(keys)
-        return sum([int(v) for v in values if v is not None])
+        
+        # Sum up all valid numbers
+        total_load = sum([int(v) for v in values if v is not None])
+        return total_load
+
     except Exception as e:
         print(f"⚠️ Redis Read Error: {e}")
         return 0
@@ -49,17 +70,20 @@ def get_osm_physics(start_coords, end_coords):
             return route["distance"], route["duration"]
     except Exception as e:
         print(f"OSRM Connection Error: {e}")
-    return 0.0, 0.0
+    return 5000.0, 900.0 # Fallback default
 
 def estimate_traffic_factor(hour_of_day: float) -> float:
     morning_peak = 0.4 * np.exp(-0.5 * ((hour_of_day - 9) / 2) ** 2)
     evening_peak = 0.5 * np.exp(-0.5 * ((hour_of_day - 18) / 2) ** 2)
     return 1.0 + morning_peak + evening_peak
 
+# --- DEBUG ENDPOINT (Add this to see inside the container) ---
+
+
 # --- Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Starting ONNX ETA Engine...")
+    print("🚀 Starting ONNX ETA Engine (HARDCODED PATHS)...")
     
     # 1. Connect to Redis
     global redis_client
@@ -70,40 +94,65 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Redis Connection Failed: {e}")
 
-    # 2. Load ONNX Models
-    # We look for onnx_manifest.json now
-    if not os.path.exists("onnx_manifest.json"):
-        print("❌ CRITICAL: onnx_manifest.json not found! Run convert_to_onnx.py first.")
-    else:
-        with open("onnx_manifest.json", "r") as f:
-            manifest = json.load(f)
+    # 2. Load ONNX Models (Direct Load - No Manifest)
+    # This forces the app to look in the current folder.
+    model_files = {
+        "cooking": "cooking.onnx",
+        "allocation": "allocation.onnx",
+        "delivery": "delivery.onnx"
+    }
 
-        key_map = {
-            "ETA_Cooking_Prediction": "cooking",
-            "ETA_Allocation_Prediction": "allocation",
-            "ETA_LastMile_Prediction": "delivery"
-        }
-
-        for exp_name, app_key in key_map.items():
-            if exp_name in manifest:
-                path = manifest[exp_name].replace("\\", "/")
-                if os.path.exists(path):
-                    try:
-                        # Load into ONNX Runtime
-                        session = ort.InferenceSession(path)
-                        models[app_key] = session
-                        print(f"✅ {app_key} ONNX MODEL LOADED.")
-                    except Exception as e:
-                        print(f"❌ Error loading {app_key}: {e}")
-                else:
-                    print(f"⚠️ Missing file: {path}")
+    for name, filename in model_files.items():
+        print(f"🔹 Attempting to load {name} from ./{filename}...")
+        try:
+            if os.path.exists(filename):
+                # Load the model
+                session = ort.InferenceSession(filename)
+                models[name] = session
+                print(f"✅ {name} LOADED SUCCESSFULLY!")
+            else:
+                print(f"❌ CRITICAL: File not found: {filename}")
+                # List files to see what IS there
+                print(f"   (Files in folder: {os.listdir('.')})")
+        except Exception as e:
+            print(f"❌ Error loading {name}: {e}")
 
     yield
     print("Shutting down...")
 
 app = FastAPI(title="ETA Prediction Engine", lifespan=lifespan)
 
+@app.get("/debug_files")
+def debug_files():
+    """Lists all files in the current directory."""
+    files = os.listdir('.')
+    manifest_exists = os.path.exists("onnx_manifest.json")
+    
+    # Check if models are loaded
+    loaded_models = list(models.keys())
+    
+    return {
+        "current_directory": os.getcwd(),
+        "files_present": files,
+        "manifest_found": manifest_exists,
+        "models_loaded": loaded_models
+    }
+# --- NEW ENDPOINT: Simulate Traffic ---
+@app.post("/simulate_traffic")
+def simulate_traffic(payload: TrafficSimulation):
+    """Injects fake load into Redis for testing."""
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    
+    # We write to a special 'simulation' key that get_restaurant_load reads
+    key = f"simulation:{payload.restaurant_id}"
+    redis_client.set(key, payload.orders_added, ex=1200) # Expires in 20 mins
+    
+    return {"message": f"Injected {payload.orders_added} fake orders for {payload.restaurant_id}"}
+
 # --- Prediction Endpoint ---
+# ... inside src/app.py ...
+
 @app.post("/predict", response_model=ETAResponse)
 def predict_eta(req: OrderRequest):
     if not models:
@@ -116,45 +165,28 @@ def predict_eta(req: OrderRequest):
     dist, duration = get_osm_physics((req.start_lon, req.start_lat), (req.end_lon, req.end_lat))
     traffic_factor = estimate_traffic_factor(req.hour_of_day)
 
-    # 3. ONNX Inference
-    # ONNX expects a Float32 Numpy Array of shape [1, N_features]
+    # 3. ONNX Inference (WITH .item() FIXES)
     
-    # A. Cooking (4 features)
-    input_cook = np.array([[
-        req.items_count, 
-        req.cuisine_complexity, 
-        req.hour_of_day, 
-        req.day_of_week
-    ]], dtype=np.float32)
-    
-    # Run Inference
-    # input_name is usually 'float_input' from our converter script
+    # A. Cooking
+    input_cook = np.array([[req.items_count, req.cuisine_complexity, req.hour_of_day, req.day_of_week]], dtype=np.float32)
     input_name = models['cooking'].get_inputs()[0].name
-    base_cooking_sec = models['cooking'].run(None, {input_name: input_cook})[0][0]
+    # 👇 FIX HERE: Add .item()
+    base_cooking_sec = models['cooking'].run(None, {input_name: input_cook})[0][0].item()
     
-    kitchen_delay = active_orders * 60.0
+    kitchen_delay = active_orders * 120.0 
     final_cooking_sec = base_cooking_sec + kitchen_delay
 
-    # B. Allocation (3 features)
-    input_alloc = np.array([[
-        req.rider_supply_index, 
-        req.hour_of_day, 
-        req.day_of_week
-    ]], dtype=np.float32)
-    
+    # B. Allocation
+    input_alloc = np.array([[req.rider_supply_index, req.hour_of_day, req.day_of_week]], dtype=np.float32)
     input_name = models['allocation'].get_inputs()[0].name
-    alloc_sec = models['allocation'].run(None, {input_name: input_alloc})[0][0]
+    # 👇 FIX HERE: Add .item()
+    alloc_sec = models['allocation'].run(None, {input_name: input_alloc})[0][0].item()
 
-    # C. Delivery (4 features)
-    input_deliv = np.array([[
-        dist, 
-        duration, 
-        traffic_factor, 
-        req.hour_of_day
-    ]], dtype=np.float32)
-    
+    # C. Delivery
+    input_deliv = np.array([[dist, duration, traffic_factor, req.hour_of_day]], dtype=np.float32)
     input_name = models['delivery'].get_inputs()[0].name
-    travel_sec = models['delivery'].run(None, {input_name: input_deliv})[0][0]
+    # 👇 FIX HERE: Add .item()
+    travel_sec = models['delivery'].run(None, {input_name: input_deliv})[0][0].item()
 
     # 4. Total
     total = final_cooking_sec + alloc_sec + travel_sec
@@ -178,6 +210,3 @@ def predict_eta(req: OrderRequest):
             "data_source": "Redis Real-Time Store"
         }
     )
-
-if __name__ == "__main__":  
-    uvicorn.run("src.app:app", host="0.0.0.0", port=8000, reload=True)
