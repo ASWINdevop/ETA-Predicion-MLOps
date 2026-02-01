@@ -9,9 +9,10 @@ import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Gauge
 
-# IMPORT SCHEMAS (Assumes you have these in src/schemas.py)
-# If you get an import error, define them inline!
+
 from src.schemas import OrderRequest, ETAResponse
 
 print("🚀 -------------------------------------------------")
@@ -122,6 +123,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ETA Prediction Engine", lifespan=lifespan)
 
+
+Instrumentator().instrument(app).expose(app)
+
+TRAFFIC_GAUGE = Gauge('eta_traffic_factor', 'Current Traffic Factor detected by the system')
+
 @app.get("/debug_files")
 def debug_files():
     """Lists all files in the current directory."""
@@ -151,7 +157,6 @@ def simulate_traffic(payload: TrafficSimulation):
     return {"message": f"Injected {payload.orders_added} fake orders for {payload.restaurant_id}"}
 
 # --- Prediction Endpoint ---
-# ... inside src/app.py ...
 
 @app.post("/predict", response_model=ETAResponse)
 def predict_eta(req: OrderRequest):
@@ -165,6 +170,7 @@ def predict_eta(req: OrderRequest):
     dist, duration = get_osm_physics((req.start_lon, req.start_lat), (req.end_lon, req.end_lat))
     traffic_factor = estimate_traffic_factor(req.hour_of_day)
 
+    TRAFFIC_GAUGE.set(traffic_factor)
     # 3. ONNX Inference (WITH .item() FIXES)
     
     # A. Cooking
