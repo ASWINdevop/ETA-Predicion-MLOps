@@ -1,14 +1,30 @@
-# Ignore heavy local folders
-.git
+# --- Heavy Environment Folders ---
 .venv
+venv
+.git
 __pycache__
-*.pyc
-.DS_Store
+.pytest_cache
 
-# Ignore large model history (we only copy the manifest and specific files)
+# --- Training Artifacts (Don't send these to Prod) ---
 mlruns
+mlflow.db
+notebooks
+*.ipynb
+requirements-dev.txt
+# --- Data Files (Keep your image code-only) ---
 *.csv
+*.json
+# EXCEPTION: We need the manifest!
+!onnx_manifest.json
 
-# Ignore infrastructure state
-infra/.terraform
-infra/terraform.tfstate
+# --- IDE & System Junk ---
+.vscode
+.idea
+.DS_Store
+*.log
+*.tmp
+
+# --- Docker config (Don't copy Docker config into itself) ---
+docker-compose.yml
+Dockerfile*
+.dockerignore

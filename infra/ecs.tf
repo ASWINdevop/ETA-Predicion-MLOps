@@ -8,6 +8,12 @@ resource "aws_cloudwatch_log_group" "osrm_backend_logs" {
   name              = "/ecs/osrm-backend"
   retention_in_days = 7
 }
+
+resource "aws_cloudwatch_log_group" "redis_logs" {
+  name              = "/ecs/redis"
+  retention_in_days = 7
+  
+}
 # 1. The Cluster (The parking lot for your containers)
 resource "aws_ecs_cluster" "main" {
   name = "eta-engine-cluster"
@@ -99,7 +105,23 @@ resource "aws_ecs_task_definition" "app" {
           "awslogs-stream-prefix" = "ecs"
         }
       }
+    },
+    {
+      name      = "redis"
+      image     = "redis:6-alpine"
+      essential = true
+      portMappings = [{ containerPort = 6379 }]
+      memoryReservation = 256
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = "/ecs/redis"
+          "awslogs-region"        = "ap-south-2"
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
     }
+
   ])
 }
 
@@ -108,7 +130,7 @@ resource "aws_ecs_service" "app" {
   name            = "eta-engine-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 0
+  desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
