@@ -1,0 +1,12 @@
+# Include production deps
+-r requirements.txt
+
+# Training & Experimentation
+pandas
+scikit-learn
+xgboost
+mlflow
+jupyter
+matplotlib
+tf2onnx>=1.15.0
+onnxmltools>=1.11.0
