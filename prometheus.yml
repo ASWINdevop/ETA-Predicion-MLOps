@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s # Scrape often for real-time feel
+
+scrape_configs:
+  - job_name: 'eta-engine-cloud'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['40.192.99.165:8000'] # ⚠️ PASTE YOUR AWS PUBLIC IP HERE
